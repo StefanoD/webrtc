@@ -39,17 +39,24 @@ impl Runtime for SmolRuntime {
         }
     }
 
-    fn spawn_reactor(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> super::JoinHandle {
+    fn spawn_reactor(
+        &self,
+        future: Pin<Box<dyn Future<Output = ()> + Send>>,
+        core_id: Option<usize>,
+    ) -> super::JoinHandle {
         let join = std::thread::Builder::new()
             // Keep <= 15 bytes so the name survives Linux's `comm` truncation.
             .name("webrtc-reactor".into())
             .spawn(move || {
+                // Optionally pin this thread to a CPU core (best-effort). Note:
+                // this pins the driver *task*, but smol's reactor is process-global,
+                // so socket polling happens on smol's own thread and is not pinned.
+                if let Some(core_id) = core_id {
+                    super::pin_current_thread_to_core(core_id);
+                }
                 // Dedicated thread driving this connection's event loop to keep it
                 // off the shared global executor. smol's reactor is process-global,
                 // so sockets wrapped inside `future` are safe to poll here.
-                // TODO(#101): this confines the driver to one thread but does not
-                // pin that thread to a CPU core; a follow-up can set core affinity
-                // via the `core_affinity` crate for cache/NUMA locality.
                 ::smol::block_on(future);
             })
             .expect("failed to spawn dedicated reactor thread");

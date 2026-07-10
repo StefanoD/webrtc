@@ -160,6 +160,18 @@ pub trait PeerConnectionEventHandler: Send + Sync + 'static {
     async fn on_track(&self, _track: Arc<dyn TrackRemote>) {}
 }
 
+/// The OS logical-core indices available for pinning a dedicated reactor thread
+/// via [`PeerConnectionBuilder::with_dedicated_reactor_thread_on_core`].
+///
+/// Returns an empty vector if the platform does not support core enumeration.
+pub fn available_core_ids() -> Vec<usize> {
+    core_affinity::get_core_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|core| core.id)
+        .collect()
+}
+
 /// Builder for constructing a [`PeerConnection`].
 ///
 /// Configures the configuration, media engine, setting engine, interceptor registry,
@@ -175,6 +187,7 @@ where
     udp_addrs: Vec<A>,
     tcp_addrs: Vec<A>,
     dedicated_reactor: bool,
+    reactor_core_id: Option<usize>,
 }
 
 impl<A: ToSocketAddrs> Default for PeerConnectionBuilder<A, NoopInterceptor> {
@@ -187,6 +200,7 @@ impl<A: ToSocketAddrs> Default for PeerConnectionBuilder<A, NoopInterceptor> {
             udp_addrs: vec![],
             tcp_addrs: vec![],
             dedicated_reactor: false,
+            reactor_core_id: None,
         }
     }
 }
@@ -237,6 +251,7 @@ where
             udp_addrs: self.udp_addrs,
             tcp_addrs: self.tcp_addrs,
             dedicated_reactor: self.dedicated_reactor,
+            reactor_core_id: self.reactor_core_id,
         }
     }
 
@@ -277,14 +292,38 @@ where
     /// thousands of connections.
     ///
     /// Note: this is *thread confinement*, not CPU-core affinity — the OS
-    /// scheduler may still move the dedicated thread between cores.
-    /// TODO(#101): pin the reactor thread to a specific core (via `core_affinity`)
-    /// for cache/NUMA locality as a follow-up.
+    /// scheduler may still move the dedicated thread between cores. To also pin
+    /// the thread to a specific core (for cache/NUMA locality), use
+    /// [`with_dedicated_reactor_thread_on_core`](Self::with_dedicated_reactor_thread_on_core).
     ///
     /// Note: with this enabled, event-handler callbacks run on the dedicated
     /// reactor thread, so they must not block.
     pub fn with_dedicated_reactor_thread(mut self, enabled: bool) -> Self {
         self.dedicated_reactor = enabled;
+        if !enabled {
+            self.reactor_core_id = None;
+        }
+        self
+    }
+
+    /// Like [`with_dedicated_reactor_thread(true)`](Self::with_dedicated_reactor_thread),
+    /// but additionally *pins* the dedicated reactor thread to CPU core `core_id`
+    /// (via the `core_affinity` crate), so the OS scheduler keeps it on one core
+    /// for cache/NUMA locality (issue #101).
+    ///
+    /// `core_id` is an OS logical-core index; enumerate the available cores with
+    /// [`available_core_ids`]. If the id is invalid or pinning is unsupported on
+    /// the platform, the thread still runs correctly, just unpinned (a warning is
+    /// logged) — pinning is a best-effort optimization, never a correctness
+    /// requirement.
+    ///
+    /// Caveat: on the smol runtime the driver *task* is pinned, but smol's I/O
+    /// reactor is a process-global thread, so socket polling is not pinned by
+    /// this. The tokio runtime pins a `current_thread` runtime whose own I/O and
+    /// timer drivers live on the pinned thread, so pinning is complete there.
+    pub fn with_dedicated_reactor_thread_on_core(mut self, core_id: usize) -> Self {
+        self.dedicated_reactor = true;
+        self.reactor_core_id = Some(core_id);
         self
     }
 
@@ -306,7 +345,10 @@ where
             self.mdns_mode,
             self.udp_addrs,
             self.tcp_addrs,
-            self.dedicated_reactor,
+            ReactorConfig {
+                dedicated: self.dedicated_reactor,
+                core_id: self.reactor_core_id,
+            },
         )
         .await
     }
@@ -507,6 +549,17 @@ where
     }
 }
 
+/// How a peer connection's driver is scheduled — bundled so the two related
+/// knobs travel together (and keep [`PeerConnectionImpl::new`] within clippy's
+/// argument-count limit).
+#[derive(Clone, Copy)]
+pub(crate) struct ReactorConfig {
+    /// Run the driver on a dedicated OS thread instead of the shared runtime.
+    pub(crate) dedicated: bool,
+    /// If dedicated, pin that thread to this CPU core (best-effort).
+    pub(crate) core_id: Option<usize>,
+}
+
 impl<I> PeerConnectionImpl<I>
 where
     I: Interceptor,
@@ -519,8 +572,12 @@ where
         mdns_mode: MulticastDnsMode,
         udp_addrs: Vec<A>,
         tcp_addrs: Vec<A>,
-        dedicated_reactor: bool,
+        reactor: ReactorConfig,
     ) -> Result<Self> {
+        let ReactorConfig {
+            dedicated: dedicated_reactor,
+            core_id: reactor_core_id,
+        } = reactor;
         // Bind the std sockets up front (synchronous, and needed to compute the
         // local addresses used for ICE gathering / SDP). Wrapping them into async
         // I/O resources is deferred so it can happen on whichever runtime actually
@@ -640,7 +697,7 @@ where
         };
 
         let driver_handle = if dedicated_reactor {
-            runtime.spawn_reactor(Box::pin(run_driver))
+            runtime.spawn_reactor(Box::pin(run_driver), reactor_core_id)
         } else {
             runtime.spawn(Box::pin(run_driver))
         };

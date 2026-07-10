@@ -230,6 +230,15 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Opt into the dedicated per-connection reactor thread (issue #101) via env.
     let dedicated_reactor = std::env::var("FLOW_DEDICATED_REACTOR").is_ok();
+    // Optionally pin each peer's dedicated reactor thread to a specific CPU core:
+    // FLOW_REACTOR_CORES="<requester_core>,<responder_core>", e.g. "0,2". Pin the
+    // two peers to distinct cores so they don't contend. Implies a dedicated
+    // reactor. Enumerate valid cores with `webrtc::peer_connection::available_core_ids`.
+    let reactor_cores: Option<(usize, usize)> =
+        std::env::var("FLOW_REACTOR_CORES").ok().and_then(|s| {
+            let mut it = s.split(',').filter_map(|x| x.trim().parse::<usize>().ok());
+            Some((it.next()?, it.next()?))
+        });
 
     // ── Build requester peer connection ──────────────────────────────────────
     let (req_gather_tx, mut req_gather_rx) = channel::<()>(1);
@@ -237,7 +246,7 @@ async fn async_main() -> anyhow::Result<()> {
     req_media.register_default_codecs()?;
     let req_registry = register_default_interceptors(Registry::new(), &mut req_media)?;
 
-    let requester = PeerConnectionBuilder::new()
+    let requester_builder = PeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(req_media)
         .with_interceptor_registry(req_registry)
@@ -246,10 +255,13 @@ async fn async_main() -> anyhow::Result<()> {
             done_tx: done_tx.clone(),
         }))
         .with_runtime(runtime.clone())
-        .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
-        .with_dedicated_reactor_thread(dedicated_reactor)
-        .build()
-        .await?;
+        .with_udp_addrs(vec!["127.0.0.1:0".to_string()]);
+    let requester = match reactor_cores {
+        Some((req_core, _)) => requester_builder.with_dedicated_reactor_thread_on_core(req_core),
+        None => requester_builder.with_dedicated_reactor_thread(dedicated_reactor),
+    }
+    .build()
+    .await?;
 
     // Create data channel (unordered, no retransmits — maximises raw throughput)
     let dc = requester
@@ -347,7 +359,7 @@ async fn async_main() -> anyhow::Result<()> {
     resp_media.register_default_codecs()?;
     let resp_registry = register_default_interceptors(Registry::new(), &mut resp_media)?;
 
-    let responder = PeerConnectionBuilder::new()
+    let responder_builder = PeerConnectionBuilder::new()
         .with_configuration(RTCConfigurationBuilder::new().build())
         .with_media_engine(resp_media)
         .with_interceptor_registry(resp_registry)
@@ -357,10 +369,13 @@ async fn async_main() -> anyhow::Result<()> {
             done_tx: done_tx.clone(),
         }))
         .with_runtime(runtime.clone())
-        .with_udp_addrs(vec!["127.0.0.1:0".to_string()])
-        .with_dedicated_reactor_thread(dedicated_reactor)
-        .build()
-        .await?;
+        .with_udp_addrs(vec!["127.0.0.1:0".to_string()]);
+    let responder = match reactor_cores {
+        Some((_, resp_core)) => responder_builder.with_dedicated_reactor_thread_on_core(resp_core),
+        None => responder_builder.with_dedicated_reactor_thread(dedicated_reactor),
+    }
+    .build()
+    .await?;
 
     // In-process signaling: set the offer, create an answer, wait for ICE
     responder.set_remote_description(offer_sdp).await?;

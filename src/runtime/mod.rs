@@ -83,6 +83,21 @@ fn reactor_join_handle(join: std::thread::JoinHandle<()>) -> JoinHandle {
     }
 }
 
+/// Best-effort pin the current thread to CPU core `core_id` (via `core_affinity`),
+/// called at the start of a dedicated reactor thread. Pinning is an optimization,
+/// not a correctness requirement, so an invalid id or an unsupported platform just
+/// logs a warning and leaves the thread running unpinned.
+#[cfg(any(feature = "runtime-tokio", feature = "runtime-smol"))]
+fn pin_current_thread_to_core(core_id: usize) {
+    if core_affinity::set_for_current(core_affinity::CoreId { id: core_id }) {
+        log::debug!("pinned dedicated reactor thread to CPU core {core_id}");
+    } else {
+        log::warn!(
+            "failed to pin dedicated reactor thread to CPU core {core_id}; running unpinned"
+        );
+    }
+}
+
 /// Abstracts I/O and timer operations for runtime independence
 ///
 /// This trait allows the WebRTC implementation to work with different async runtimes
@@ -97,7 +112,8 @@ pub trait Runtime: Send + Sync + Debug + 'static {
     #[track_caller]
     fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle;
 
-    /// Drive `future` to completion on a dedicated single-threaded reactor.
+    /// Drive `future` to completion on a dedicated single-threaded reactor,
+    /// optionally pinned to CPU core `core_id`.
     ///
     /// The tokio and smol implementations spawn a dedicated OS thread with its
     /// own single-threaded runtime, confining a peer-connection driver to that
@@ -106,13 +122,21 @@ pub trait Runtime: Send + Sync + Debug + 'static {
     /// #101). The socket wrapping and the whole event loop run inside `future`,
     /// on this reactor, so I/O resources bind to the dedicated runtime's reactor.
     ///
-    /// This is thread confinement, not CPU-core affinity: the OS scheduler may
-    /// still move the thread between cores. Pinning it to a specific core (via
-    /// `core_affinity`) is a planned follow-up (issue #101).
+    /// When `core_id` is `Some`, the reactor thread also sets its CPU affinity to
+    /// that core (via `core_affinity`) for cache/NUMA locality. Pinning is
+    /// best-effort: an invalid id or an unsupported platform leaves the thread
+    /// running unpinned. Without confinement to a single thread, affinity would be
+    /// meaningless, so the default (`spawn`-based) implementation ignores
+    /// `core_id`.
     ///
     /// The default implementation falls back to [`Runtime::spawn`] on the ambient
     /// runtime, so custom runtimes keep working (without the confinement benefit).
-    fn spawn_reactor(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) -> JoinHandle {
+    fn spawn_reactor(
+        &self,
+        future: Pin<Box<dyn Future<Output = ()> + Send>>,
+        core_id: Option<usize>,
+    ) -> JoinHandle {
+        let _ = core_id;
         self.spawn(future)
     }
 
